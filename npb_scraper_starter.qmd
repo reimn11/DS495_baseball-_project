@@ -1,0 +1,554 @@
+---
+title: "NPB Scraper: Starter Kit"
+subtitle: "DS-495 Capstone — Foreign Players in NPB"
+date: today
+format: html
+editor: visual
+---
+
+## How to use this document
+
+This is a **starter kit**, not a finished scraper. It has three kinds of chunks:
+
+- **WORKED EXAMPLE** chunks run as-is. Read them line by line and make sure you can explain every step.
+- **YOUR TURN** chunks are partially built. Look for `# TODO` comments — those are yours to do.
+- **THINK** sections have no code. Write your answers in prose right in this document.
+
+Work through it in order. Don't skip the ethics section: it shapes how the whole scraper is built.
+
+```{r setup}
+#install.packages(c("rvest", "tidyverse", "fs"))
+library(rvest)
+library(tidyverse)
+library(fs)
+```
+
+# Part 0: Ethics & Politeness Check (THINK)
+
+Before writing a single loop, answer these. Put your answers under each bullet.
+
+- **robots.txt:** Open <https://npb.jp/robots.txt>.
+  - *Answer:* Does not exist! Doesn't mean that all scraping is automatically allowed
+- **Terms of use / copyright:** Every NPB page says "All Rights Reserved." What does that mean for (a) collecting data for a class project vs. (b) publishing the raw dataset on GitHub?
+  - \*Answer:
+
+    \(b\) in the npb.jp's term of uses says 'secondary use and unauthorized reposting are prohibited'. Putting NPB's tables online could replace the original source, that will be prohibited.\
+
+    \(a\) Based on the term of uses above, downloading pages to pull out facts for non-commercial school project may be low risk.\*
+- **Personal data:** Player pages include birthdates, height, and weight. These are public figures, but it's still personal data. What will you keep, and why?
+  - \*Answer: I will keep Player ID, Name, Birthdate, Bats, and Position.
+  - Player ID: Key for joint
+  - Name: Need to match 'baseballr'
+  - Birthdate: Needed for age at arrival.
+  - Bats: needed for analyzing characteristics
+  - Position: needed for analyzing characteristics
+- **Server load:** How many pages will your full scrape request? (You'll be able to estimate this after Part 2.) How long should you wait between requests?
+  - *Answer:*
+
+## The one rule we build in from the start: download each page ONCE
+
+We'll save every page we download to disk. If you re-run your code (you will, many times), it reads your saved copy instead of hitting NPB's server again. That way you don't get blocked by NPB and also it is faster. This helper function does that for you.
+
+```{r helper-get-page}
+# WORKED EXAMPLE (complete — you don't need to change this)
+
+cache_dir <- "raw_html"
+dir_create(cache_dir)
+
+get_page <- function(url, delay = 3) {
+  # turn the URL into a safe filename
+  file_name <- url %>%
+    str_remove("^https?://") %>%
+    str_replace_all("[/:?=&]", "_")
+  file_path <- path(cache_dir, file_name)
+
+  # if we already have it, read from disk (no request to the server)
+  if (file_exists(file_path)) {
+    return(read_html(file_path))
+  }
+
+  # otherwise: wait politely, download, save, return
+  Sys.sleep(delay)
+  message("Downloading: ", url)
+  html <- read_html(url)
+  xml2::write_html(html, file_path)
+  html
+}
+```
+
+# Part 1: One Player Page (WORKED EXAMPLE)
+
+Pull one page, pull out the pieces, build a tibble.
+
+## Step 1: Read the page
+
+```{r p1-read}
+player_url <- "https://npb.jp/bis/eng/players/73075159.html"
+player_html <- get_page(player_url)
+player_html
+```
+
+## Step 2: Get the player ID from the URL
+
+Every player has an 8-digit ID in the URL. This will be our key for joining tables later — much safer than names (the 2019 Giants had *three* different players named Yoshikawa).
+
+- **`\d`** means "any digit 0=9"
+
+- `+` means "one or more in a row"
+
+- `(?= ... )`is the lookahead syntax. It checks what comes next without taking it.
+
+- `\\.` is a literal dot. A plain `.` in regex means "any character," so it has to be escaped to mean an actual period.
+
+- `html` is just the letters h-t-m-l.
+
+```{r p1-id}
+player_id <- str_extract(player_url, "\\d+(?=\\.html)") # first \ is itself an escape character
+player_id
+```
+
+## Step 3: Get the name and team from the page title
+
+The `<title>` looks like `Reyes,Franmil（Hokkaido Nippon-Ham Fighters） | Players | ...`. Notice those are **full-width** Japanese parentheses `（ ）`, not regular `( )`. That matters for our regex!
+
+```{r p1-title}
+page_title <- player_html %>%
+  html_element("title") %>% # It finds the `<title>` from html
+  html_text2() # remove the html tag like '<title>'
+
+player_name <- str_extract(page_title, "^[^（]+")          # everything before （
+player_team <- str_extract(page_title, "(?<=（)[^）]+")     # everything between （ and ）
+
+player_name
+player_team
+```
+
+## Step 4: Find all the tables on the page
+
+The page has (at least) two tables: a small bio table and a stats table. Let's look at all of them before deciding which is which.
+
+```{r p1-tables}
+all_tables <- player_html %>% html_elements("table")
+length(all_tables) # Theare are two tables
+
+# peek at the first few rows of each one
+all_tables %>%
+  html_table(header = FALSE) %>%
+  map(head, 3)
+```
+
+## Step 5: The bio table
+
+The bio table is "long" (field name in column 1, value in column 2). We find it by looking for the word "Born", then pivot it wide so it's one row per player.
+
+```{r p1-bio}
+bio <- all_tables %>%
+  keep(~ str_detect(html_text2(.x), "Born")) %>%
+  pluck(1) %>%
+  html_table(header = FALSE) %>%
+  select(field = X1, value = X2) %>%
+  pivot_wider(names_from = field, values_from = value) %>%
+  mutate(player_id = player_id,
+         name = player_name,
+         current_team = player_team,
+         .before = 1)
+
+bio
+```
+
+## Is this same?
+
+```{r}
+
+bio_2 <- player_html %>%
+  html_element("#pc_bio table") %>%    # the <table> inside the section with id pc_bio
+  html_table(header = FALSE) |> 
+  select(field = X1, value = X2) %>% # rename? 
+  pivot_wider(names_from = field, values_from = value) %>% # reshape the tbales long to wide
+  mutate(player_id = player_id,
+         name = player_name,
+         current_team = player_team,
+         .before = 1)
+
+bio_2
+```
+
+## Step 6: The stats table
+
+```{r p1-stats}
+batting <- all_tables %>%
+  keep(~ str_detect(html_text2(.x), "Year")) %>%
+  pluck(1) %>%
+  html_table(header = TRUE) %>%
+  filter(Team != "Totals") %>%        # drop the career-totals row
+  mutate(player_id = player_id, .before = 1)
+
+batting
+```
+
+## Is this same? 2
+
+```{r}
+batting_2 <- player_html %>%
+  html_element("#pc_stats_wrapper #tablefix_b") %>% # #stats_b works as well
+  html_table(header = TRUE) %>%
+  filter(Team != "Totals") %>%        # drop the career-totals row
+  mutate(player_id = player_id, .before = 1)
+
+batting_2
+```
+
+**Checkpoint:** You should have a `bio` tibble with 1 row and a `batting` tibble with one row per season.
+
+### THINK
+
+- Reyes is an outfielder. What happens with a **pitcher's** page? Open one (try Sun, Yi-Lei: <https://npb.jp/bis/eng/players/83785159.html>). Is there a pitching table? A batting table? Both? What would break in Step 6?
+- What if a player was traded mid-season? How many rows would that year have?
+
+# Part 2: One Roster Page → A List of Player URLs (WORKED EXAMPLE)
+
+Scraping player pages one at a time by hand doesn't scale. Instead, we find a page that **lists** players and collect the links. Each team has an active roster page at `https://npb.jp/bis/eng/players/active/rst_{team}.html`.
+
+```{r p2-roster}
+roster_url <- "https://npb.jp/bis/eng/players/active/rst_f.html"   # Nippon-Ham
+roster_html <- get_page(roster_url)
+
+# grab every link on the page
+links <- roster_html %>% html_elements("a")
+
+roster <- tibble(
+  link_text = html_text2(links),
+  href      = html_attr(links, "href")
+) %>%
+  # keep only links to individual player pages (8 digits + .html)
+  filter(str_detect(href, "/players/\\d{8}\\.html")) %>%
+  mutate(
+    url       = url_absolute(href, roster_url),   # handles relative links
+    player_id = str_extract(href, "\\d{8}")
+  ) %>%
+  distinct(player_id, .keep_all = TRUE)
+
+roster
+nrow(roster)
+```
+
+### YOUR TURN: clean up `link_text`
+
+Right now `link_text` is mashed together, like `"99 OutfielderReyes, FranmilHokkaido Nippon-Ham Fighters"`. The number, position, and name are probably in separate HTML elements inside each link.
+
+```{r p2-yourturn}
+# TODO: Right-click a player on the roster page → Inspect Element.
+#       What tags/classes hold the uniform number, position, and name?
+#       Use html_element() on `links` (or on the <a> tags you filtered)
+#       with those selectors to make clean columns.
+#   Each player on the roster page is an <a class="player_unit_1"> link.
+#   Inside it, a <dl> holds three <dd> elements:
+#     dd.pos  -> uniform number AND position together, e.g. "12 Pitcher"
+#     dd.name -> player name, e.g. "Yazawa, Kota"
+#     dd.team -> team name
+
+# TODO: Developmental-squad players show "(*)" after their position.
+#       Make a TRUE/FALSE column called `developmental`.
+
+
+```
+
+```{r}
+player_links <- roster_html %>% html_elements(".player_unit_1")
+length(player_links)
+```
+
+```{r}
+roster_clean <- tibble(
+  href = html_attr(player_links, "href"),
+  name = player_links |> html_element(".name") |> html_text2(),
+  pos  = player_links |> html_element(".pos")  |> html_text2(),
+  team = player_links |> html_element(".team") |> html_text2()
+) |>
+  mutate(
+    url           = url_absolute(href, roster_url),       # full URL 
+    player_id     = str_extract(href, "\\d{8}"),           # join key
+    number        = str_extract(pos, "^\\d+"),             # "113 Pitcher (*)" → "113"
+    developmental = str_detect(pos, "\\(\\*\\)"),          # TRUE if (*) is present
+    position      = pos |>
+      str_remove("^\\d+") |>                               # → " Pitcher (*)"
+      str_remove("\\(\\*\\)") |>                           # → " Pitcher "
+      str_trim()                                           # → "Pitcher"
+  ) |>
+  select(player_id, number, name, position, developmental, team, url)
+
+roster_clean
+```
+
+\
+
+# Part 3: Scale It Up (YOUR TURN)
+
+## Step 1: Every current team
+
+```{r p3-teams}
+# Team codes used in the CURRENT roster URLs
+team_codes <- c("g", "t", "db", "c", "s", "d",     # Central League
+                "h", "f", "m", "e", "b", "l")      # Pacific League
+
+roster_urls <- str_glue("https://npb.jp/bis/eng/players/active/rst_{team_codes}.html")
+roster_urls
+```
+
+```{r p3-all-rosters}
+# TODO: Turn your Part 2 code into a function, scrape_roster(url),
+#       that returns a tibble of player links for ONE roster page.
+scrape_roster <- function(url) {
+  html <- get_page(url)
+  # TODO: your Part 2 code here
+  
+  # Create player_links 
+  player_links <- html %>% html_elements(".player_unit_1")
+  length(player_links)
+  
+  # roster clean (Part 2 Code)
+  tibble(
+    href = html_attr(player_links, "href"),
+    name = player_links |> html_element(".name") |> html_text2(),
+    pos  = player_links |> html_element(".pos")  |> html_text2(),
+    team = player_links |> html_element(".team") |> html_text2()
+  ) |>
+    mutate(
+      player_url    = url_absolute(href, roster_url),        # full URL 
+      player_id     = str_extract(href, "\\d{8}"),           # join key
+      number        = str_extract(pos, "^\\d+"),             
+      developmental = str_detect(pos, "\\(\\*\\)"),          
+      position      = pos |>
+        str_remove("^\\d+") |>                               
+        str_remove("\\(\\*\\)") |>                           
+        str_trim(),                                          
+      team_code = str_extract(url, "(?<=rst_)[a-z]+(?=\\.html)")                                                    
+    ) |>
+    select(player_id, number, name, position, developmental, team, team_code, player_url)
+
+  
+  }
+
+# TODO: run it over all 12 rosters and stack the results
+# hint: map() then list_rbind()   (or map_dfr())
+# all_rosters <- ...
+
+all_rosters <- roster_urls |>
+  map(scrape_roster) |>
+  list_rbind()
+
+all_rosters
+```
+
+`team_code`:
+
+- `(?<=rst_)`: the **lookbehind** (Step 3) means "right after `rst_`."
+
+- `[a-z]+`: one or more lowercase letters (`f`, `g`, `db`, ...).
+
+- `(?=\\.html)`: the **lookahead** (Step 2) means "right before `.html`."
+
+## Step 2: Every player page
+
+I put three tibbles `bio`, `batting` and `pitching`. I thought I don't use pitcher but if I have a time I want to try analise them too. I may can use filter to remove the pitcher, if I can't. For now just want to focus for the batter.
+
+```{r p3-players}
+# TODO: Turn your Part 1 code into a function, scrape_player(url),
+#       that returns a LIST with two tibbles: bio and stats.
+#       It needs to handle batting-only, pitching-only, and both.
+scrape_player <- function(url) {
+  html <- get_page(url)
+  # TODO
+  player_id <- str_extract(url, "\\d{8}(?=\\.html)")       # Part 1, Step 2
+  
+  # ---- bio (Part 1, Step 5) ----
+  bio <- html |>
+    html_element("#pc_bio table") |>
+    html_table(header = FALSE) |>
+    select(field = X1, value = X2) |>
+    pivot_wider(names_from = field, values_from = value) |>
+    mutate(player_id = player_id,
+           name      = html |> html_element("li#pc_v_name") |> html_text2(),
+           .before = 1) |>
+    select(-any_of("Height / Weight"))                     
+
+  # ---- batting ----
+  batting_tbl <- html |> html_element("#pc_stats_wrapper #tablefix_b")
+  if (inherits(batting_tbl, "xml_missing")) {
+    batting <- NULL
+  } else {
+    batting <- batting_tbl |>
+      html_table(header = TRUE) |>
+      as_tibble(.name_repair = "unique") |>        # fixes empty column names
+      filter(Team != "Totals") |>
+      mutate(across(everything(), as.character)) |>
+      mutate(player_id = player_id, .before = 1)
+  }
+  
+  # ---- pitching ----
+  pitching_tbl <- html |> html_element("#pc_stats_wrapper #tablefix_p")
+  if (inherits(pitching_tbl, "xml_missing")) {
+    pitching <- NULL
+  } else {
+    headers <- pitching_tbl |>
+      html_elements(xpath = "./thead/tr/th") |>     # header
+      html_text2()
+    
+    pitching <- pitching_tbl |>
+      html_elements(xpath = "./tbody/tr") |>        # just only tbody, not tfoot, and Totals
+      map(\(row) row |>
+            html_elements(xpath = "./td") |>        # just td
+            html_text2() |>
+            as.list() |>
+            set_names(headers) |>                   # stop when doens't match
+            as_tibble_row()) |>
+      list_rbind() |>
+      mutate(IP = str_remove_all(IP, "\\s")) |>
+      mutate(player_id = player_id, .before = 1)
+  }                                                         
+  # ---- stats (Part 1, Step 6), for each table that exists ----
+
+  list(bio = bio, batting = batting, pitching = pitching)  
+}                                                          
+
+
+# TODO: Some pages will fail (typos, missing tables, a new player
+#       with no stats yet). Wrap your function so ONE failure
+#       doesn't kill the whole loop. Look up purrr::possibly().
+
+safe_scrape_player <- possibly(scrape_player, otherwise = NULL)
+
+
+```
+
+```{r}
+# TODO: BEFORE you run this on everyone, test on 3-5 players only.
+#       How many total requests will the full run make?
+#       At 3 seconds each, how long will it take?
+
+# ---- 1. Test on 5 players (mix of player types) ----
+test_urls <- c(
+  all_rosters |> filter(position == "Outfielder") |> slice(1:2) |> pull(player_url),
+  all_rosters |> filter(position == "Pitcher")    |> slice(1:2) |> pull(player_url),
+  all_rosters |> filter(developmental)            |> slice(1)   |> pull(player_url)
+)
+
+test_results <- map(test_urls, safe_scrape_player)
+
+test_bio      <- test_results |> map("bio")      |> list_rbind()
+test_batting  <- test_results |> map("batting")  |> list_rbind()
+test_pitching <- test_results |> map("pitching") |> list_rbind()
+
+# ---- 2. Check the test results ----
+test_urls[map_lgl(test_results, is.null)]                  # failures: expect none
+test_bio |> select(player_id, name, Position)              # expect 5 rows
+test_batting  |> filter(!str_detect(Year, "^\\d{4}$"))     # expect 0 rows
+test_pitching |> filter(!str_detect(Year, "^\\d{4}$"))     # expect 0 rows
+names(test_batting); names(test_pitching)                  # expect no "..." names
+
+# ---- 3. How many requests, and how long? ----
+n_total  <- n_distinct(all_rosters$player_id)  
+n_total
+
+n_cached <- dir_ls(cache_dir, regexp = "players_\\d{8}\\.html$") |> length() 
+n_cached
+
+n_new    <- n_total - n_cached                                           
+n_new * 3 / 60                                                           
+```
+
+# Part 4: Going Back in Time (THINK first, then YOUR TURN)
+
+Here's the catch: the roster pages only list **active** players. Your research question is about foreign players who **leave**, and by definition, most of them are no longer on a roster. You need a historical source.
+
+NPB publishes season-by-team stat pages with a very predictable URL pattern:
+
+```         
+https://npb.jp/bis/eng/{YEAR}/stats/idb1_{TEAM}.html   ← batting, regular season
+https://npb.jp/bis/eng/{YEAR}/stats/idp1_{TEAM}.html   ← pitching, regular season
+(idb2 / idp2 = farm league)
+```
+
+A predictable URL pattern is the single most useful thing you can find when scraping. It means you can **generate** every URL you need instead of clicking to find them.
+
+## Worked example: one season page
+
+```{r p4-season}
+season_url <- "https://npb.jp/bis/eng/2019/stats/idb1_g.html"   # 2019 Giants batting
+season_html <- get_page(season_url)
+
+season_raw <- season_html %>%
+  html_elements("table") %>%
+  keep(~ str_detect(html_text2(.x), "Player") &
+         str_detect(html_text2(.x), "AVG")) %>%
+  pluck(1) %>%                      # if this grabs the wrong table, inspect and adjust!
+  html_table(header = FALSE)
+
+# the real column names are in the row that says "Player"
+header_row <- which(season_raw$X2 == "Player")
+names(season_raw) <- c("hand", unlist(season_raw[header_row, -1]))
+
+season_2019_g <- season_raw %>%
+  slice((header_row + 1):n()) %>%
+  mutate(
+    hand = case_when(hand == "*" ~ "L",       # * = lefthanded batter
+                     hand == "+" ~ "S",       # + = switch-hitter
+                     TRUE        ~ "R"),
+    year = 2019,
+    team = "g",
+    .before = 1
+  )
+
+season_2019_g
+```
+
+## YOUR TURN: build the URL grid
+
+```{r p4-grid}
+# expand_grid() makes every combination of its inputs
+season_grid <- expand_grid(
+  year = 2015:2025,        # TODO: how far back do the English pages go? Find out.
+  team = team_codes,
+  type = c("idb1", "idp1")
+) %>%
+  mutate(url = str_glue("https://npb.jp/bis/eng/{year}/stats/{type}_{team}.html"))
+
+nrow(season_grid)
+season_grid
+
+# TODO: Team codes have NOT been constant over time. For example,
+#       ORIX's code was "bs" in 2016-2018 but "b" by 2021. Find the
+#       correct code for every team in every year (the team links at
+#       the top of each season page will tell you). Fix the grid.
+#
+# TODO: Write scrape_season(url) and run it over the grid.
+#       Remember possibly() for URLs that don't exist.
+#
+# TODO: The pitching pages (idp1) will have different columns. Check.
+```
+
+### THINK
+
+- The season pages list players by **name only** (no player ID). How will you track the same person across years? What goes wrong with duplicate names? Could you link season-page names back to player IDs using the player pages?
+- What does it mean, in this data, for a player to "leave"? Last season he appears? What about injuries, farm-only seasons, or players who move to a different NPB team?
+
+# Part 5: The Big Missing Variable (THINK)
+
+**None of the pages above say whether a player is foreign.** This is the most important data problem in your project, and there's no single right answer. Some directions to investigate:
+
+- You read Japanese. Compare the **Japanese** version of a player page (e.g., <https://npb.jp/bis/players/73075159.html>) with the English one. Does it include career history (経歴) or anything else that identifies previous leagues/schools?
+- Are there public lists of foreign-player registrations, by team and year?
+- Could you hand-code a smaller set of players with clearly documented rules? What would your rules be, and how would you handle edge cases (e.g., players born abroad who came up through Japanese high schools)?
+
+Write down which approach you choose and **why**. This becomes part of your methods section.
+
+# Common Problems & Fixes
+
+| Problem | Likely cause | Fix |
+|----|----|----|
+| `character(0)` or empty tibble | Selector doesn't match | Inspect Element; check the page actually has that table |
+| `pluck(1)` returns `NULL` | `keep()` found no matching table | Print `html_text2()` of each table and adjust the pattern |
+| Regex on names/teams fails | Full-width `（）` vs. `()` | Copy the exact character from the page |
+| 404 errors in the loop | Wrong team code for that year | Check the season page's team links; use `possibly()` |
+| Same page downloaded twice | Not using `get_page()` | Always go through `get_page()` |
+| Want a clean re-download | Stale cache | Delete the file in `raw_html/` (not the whole folder!) |

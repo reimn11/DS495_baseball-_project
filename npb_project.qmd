@@ -1,0 +1,530 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+## Packeges
+
+```{r setup}
+#install.packages(c("rvest", "tidyverse", "fs"))
+library(rvest)
+library(tidyverse)
+library(fs)
+```
+
+```{r}
+# WORKED EXAMPLE (complete — you don't need to change this)
+
+cache_dir <- "raw_html"
+dir_create(cache_dir)
+
+get_page <- function(url, delay = 3) {
+  # turn the URL into a safe filename
+  file_name <- url %>%
+    str_remove("^https?://") %>%
+    str_replace_all("[/:?=&]", "_")
+  file_path <- path(cache_dir, file_name)
+  
+  # if we already have it, read from disk (no request to the server)
+  if (file_exists(file_path)) {
+    return(read_html(file_path))
+  }
+  
+  # otherwise: wait politely, download, save, return
+  Sys.sleep(delay)
+  message("Downloading: ", url)
+  html <- read_html(url)
+  xml2::write_html(html, file_path)
+  html
+}
+```
+
+# Project: Japanese Player Pages (2010–2020)
+
+Test player from Taiwang
+
+## Part 1: One Player Page
+
+### Step 1: Read the page
+
+```{r}
+player_url  <- "https://npb.jp/bis/players/23525138.html"   # 王 柏融
+player_html <- get_page(player_url)
+player_html
+```
+
+```{r}
+player_html |> html_element("title") |> html_text2()
+```
+
+### Step 2: Player ID
+
+```{r}
+player_id <- str_extract(player_url, "\\d+(?=\\.html)") # first \ is itself an escape character
+player_id
+```
+
+### STEP 3: GET name and team
+
+```{r}
+page_title <- player_html %>%
+  html_element("title") %>% # It finds the `<title>` from html
+  html_text2() # remove the html tag like '<title>'
+
+player_name <- str_extract(page_title, "^[^（]+")          # everything before （
+player_team <- str_extract(page_title, "(?<=（)[^）]+")     # everything between （ and ）
+
+player_name
+player_team
+```
+
+### Step 4 : Find tables
+
+```{r}
+all_tables <- player_html %>% html_elements("table")
+length(all_tables) # Theare are two tables
+
+# peek at the first few rows of each one
+all_tables %>%
+  html_table(header = FALSE) %>%
+  map(head, 3)
+```
+
+### Step 5: Get the bio table
+
+```{r}
+bio <- player_html %>%
+  html_element("#pc_bio table") %>%    # the <table> inside the section with id pc_bio
+  html_table(header = FALSE) |> 
+  select(field = X1, value = X2) %>% # rename? 
+  pivot_wider(names_from = field, values_from = value) %>% # reshape the tbales long to wide
+  mutate(player_id = player_id,
+         name = player_name,
+         team = player_team,
+         .before = 1) |> 
+select(-any_of("身長／体重"))      
+
+bio
+```
+
+```{r}
+batting <- player_html %>%
+  html_element("#pc_stats_wrapper #tablefix_b") %>% # #stats_b works as well
+  html_table(header = TRUE) %>%
+  filter(str_detect(年度,"^\\d{4}$")) %>%        # drop the career-totals row
+  mutate(player_id = player_id, .before = 1)
+
+batting
+```
+
+### Combine all 
+
+```{r}
+scrape_player_jp <- function(url) {
+  html <- get_page(url) #Part1 Step1
+  # TODO
+  player_id <- str_extract(url, "\\d{8}(?=\\.html)")       # Part 1, Step 2
+  page_title <- html |> html_element("title") |> html_text2()       # Step 3
+  
+  bio <- html |>                                                     # Step 5
+    html_element("#pc_bio table") |>
+    html_table(header = FALSE) |>
+    select(field = X1, value = X2) |>
+    pivot_wider(names_from = field, values_from = value) |>
+    mutate(player_id = player_id,
+           name      = str_extract(page_title, "^[^（]+"),
+           name_kana = html |> html_element("li#pc_v_kana") |> html_text2(),
+           last_team = str_extract(page_title, "(?<=（)[^）]+"),
+           .before = 1) |>
+    select(-any_of("身長／体重"))
+  
+  # ---- batting ----
+  batting_tbl <- html |> html_element("#pc_stats_wrapper #tablefix_b")
+  if (inherits(batting_tbl, "xml_missing")) {
+    batting <- NULL
+  } else {
+    batting <- batting_tbl |>
+      html_table(header = TRUE) |>
+      as_tibble(.name_repair = "unique") |>        # fixes empty column names
+      filter(str_detect(年度,"^\\d{4}$")) %>%        # drop the career-totals row
+      mutate(across(everything(), as.character)) |>
+      mutate(player_id = player_id, .before = 1)
+  }
+  
+  # ---- pitching ----
+  pitching_tbl <- html |> html_element("#pc_stats_wrapper #tablefix_p")
+  if (inherits(pitching_tbl, "xml_missing")) {
+    pitching <- NULL
+  } else {
+    headers <- pitching_tbl |>
+      html_elements(xpath = "./thead/tr/th") |>     # header
+      html_text2()
+    
+    pitching <- pitching_tbl |>
+      html_elements(xpath = "./tbody/tr") |>        # just only tbody, not tfoot, and Totals
+      map(\(row) row |>
+            html_elements(xpath = "./td") |>        # just td
+            html_text2() |>
+            as.list() |>
+            set_names(headers) |>                   # stop when doens't match
+            as_tibble_row()) |>
+      list_rbind() |>
+      mutate(across(everything(), \(x) str_remove_all(x, "\\s"))) |>   # remove the all space
+      filter(str_detect(年度, "^\\d{4}$")) |>                          # remove 通算
+      mutate(player_id = player_id, .before = 1)
+  }                                                         
+  # ---- stats (Part 1, Step 6), for each table that exists ----
+  
+  list(bio = bio, batting = batting, pitching = pitching)  
+}                                                          
+
+
+# TODO: Some pages will fail (typos, missing tables, a new player
+#       with no stats yet). Wrap your function so ONE failure
+#       doesn't kill the whole loop. Look up purrr::possibly().
+
+safe_scrape_player <- possibly(scrape_player_jp, otherwise = NULL)
+
+```
+
+#### Test
+
+```{r}
+keppel <- scrape_player_jp("https://npb.jp/bis/players/41645131.html")
+keppel$bio
+keppel$pitching |> select(年度, 所属球団, 登板, 勝利, 投球回, 防御率)
+wang <- scrape_player_jp("https://npb.jp/bis/players/23525138.html")
+wang$batting#
+```
+
+## Part 2 Make it one roster page
+
+Try Nippon_Ham 2012
+
+```{r p-2 modify ver.}
+
+roster_url <- "https://npb.jp/bis/players/search/yearly/2015/2005001"   # Nippon-Ham 2015
+roster_html <- get_page(roster_url)
+
+links <- roster_html %>% html_elements("a")
+
+roster <- tibble(
+  link_text = html_text2(links),
+  href      = html_attr(links, "href")
+) %>%
+  filter(str_detect(href, "/players/\\d{8}\\.html")) %>%
+  mutate(
+    url        = url_absolute(href, roster_url),
+    player_id  = str_extract(href, "\\d{8}"),
+    name_jp    = str_split_i(link_text, "\n", 1) %>% str_trim(),
+    debut_note = str_split_i(link_text, "\n", 2) %>% str_trim(),
+    is_foreign_guess = str_detect(name_jp, "^[Ａ-Ｚ]．")　# this is not a final check
+  ) %>%
+  distinct(player_id, .keep_all = TRUE)
+
+roster
+nrow(roster)
+```
+
+Look correctly worked ( not include foreign players written in Kanji)
+
+```{r}
+roster %>%
+  filter(is_foreign_guess) %>%
+  select(name_jp, player_id, debut_note)
+```
+
+```{r}
+player_links <- roster_html %>% html_elements(".player_unit_1") # old_player
+length(player_links)
+```
+
+```{r}
+roster_clean <- tibble(
+  href = html_attr(player_links, "href"),
+  name = player_links |> html_element(".name") |> html_text2(),
+  note = player_links |> html_element(".note") |> html_text2() 
+) |>
+  mutate(
+    url           = url_absolute(href, roster_url),       # full URL 
+    player_id     = str_extract(href, "\\d{8}"),           # join key
+  ) |>
+  select(player_id, name, url)
+
+roster_clean
+```
+
+## Part 3
+
+### Step 1
+
+```{r}
+# コードが2010〜2020年で変わらない11球団
+constant_codes <- c(
+  "1947001",   # 読売ジャイアンツ
+  "1954001",   # 中日ドラゴンズ
+  "1961001",   # 阪神タイガース
+  "1968001",   # 広島東洋カープ
+  "1992001",   # 千葉ロッテマリーンズ
+  "2004001",   # 北海道日本ハムファイターズ
+  "2005001",   # 福岡ソフトバンクホークス
+  "2005002",   # オリックス・バファローズ
+  "2005003",   # 東北楽天ゴールデンイーグルス
+  "2006001",   # 東京ヤクルトスワローズ
+  "2008001"    # 埼玉西武ライオンズ
+)
+
+constant_grid <- expand_grid(
+  code = constant_codes,
+  year = 2010:2020
+)
+
+# 横浜：2011年まで横浜ベイスターズ、2012年から横浜DeNAベイスターズ
+yokohama_grid <- tibble(
+  year = 2010:2020,
+  code = if_else(year <= 2011, "1993001", "2012001")
+)
+
+roster_grid <- bind_rows(constant_grid, yokohama_grid) |>
+  mutate(url = str_glue("https://npb.jp/bis/players/search/yearly/{year}/{code}/"))
+
+nrow(roster_grid)     
+roster_grid |> filter(code %in% c("1993001", "2012001"))   # 横浜の11行を確認
+```
+
+```{r}
+safe_scrape_roster_jp <- possibly(scrape_roster_jp, otherwise = NULL)
+
+roster_results <- map(roster_grid$url, safe_scrape_roster_jp, .progress = TRUE)
+
+all_rosters_jp <- roster_results |> list_rbind()
+```
+
+```{r}
+
+# TODO: Turn your Part 2 code into a function, scrape_roster(url),
+#       that returns a tibble of player links for ONE roster page.
+scrape_roster_jp <- function(url) {
+  html <- get_page(url)
+  # TODO: your Part 2 code here
+  
+  # Create player_links 
+  player_links <- html %>% html_elements(".player_unit_1")
+
+  # roster clean (Part 2 Code)
+  tibble(
+    href = html_attr(player_links, "href"),
+    name = player_links |> html_element(".name") |> html_text2(),
+    note = player_links |> html_element(".note") |> html_text2()
+  ) |>
+    mutate(
+      player_url         = url_absolute(href, url),            # url ではなく player_url
+      player_id          = str_extract(href, "\\d{8}"),
+      name_looks_foreign = str_detect(name, "^[Ａ-Ｚ]．"),
+      year               = str_extract(url, "(?<=yearly/)\\d{4}"),
+      team_code          = str_extract(url, "\\d{7}(?=/?$)")
+    ) |>
+    distinct(player_id, .keep_all = TRUE) |>
+    select(player_id, name, note, name_looks_foreign, year, team_code, player_url)
+}
+
+# TODO: run it over all 12 rosters and stack the results
+# hint: map() then list_rbind()   (or map_dfr())
+# all_rosters <- ...
+
+safe_scrape_roster_jp <- possibly(scrape_roster_jp, otherwise = NULL)
+
+roster_results <- map(roster_grid$url, safe_scrape_roster_jp, .progress = TRUE)
+
+all_rosters_jp <- roster_results |> list_rbind()
+```
+
+```{r}
+roster_grid$url[map_lgl(roster_results, is.null)]       # 失敗したURL（空ならOK）
+all_rosters_jp |> count(year, team_code) |> arrange(n)  # 132行、少ない順
+nrow(all_rosters_jp)
+n_distinct(all_rosters_jp$player_id)
+```
+
+```{r}
+all_rosters_jp |> 
+  filter(name == '李　大浩')
+```
+
+### Step 3: Tets
+
+```{r}
+players_jp <- all_rosters_jp |>
+  distinct(player_id, .keep_all = TRUE)       # 1人1行（1,926行）
+
+test_ids <- c(
+  "51455119",   # 李 承燁   ：foreign player with kanji (b)
+  "91695131",   # エドガー  ：no initial foreign player）(b)
+  "23525114",   # W．オビスポ：foreign player with initial (p)
+  "21125113",   # 阿部 慎之助：Japanese (b)
+  "31135115"    # 朝井 秀樹 ：Japanese (p)
+)
+
+test_urls_jp <- players_jp |> filter(player_id %in% test_ids) |> pull(player_url)
+
+test_results_jp <- map(test_urls_jp, safe_scrape_player_jp)
+
+test_bio_jp      <- test_results_jp |> map("bio")      |> list_rbind()
+test_batting_jp  <- test_results_jp |> map("batting")  |> list_rbind()
+test_pitching_jp <- test_results_jp |> map("pitching") |> list_rbind()
+
+test_urls_jp[map_lgl(test_results_jp, is.null)]               # 失敗（空ならOK）
+test_bio_jp |> select(player_id, name, 経歴, ドラフト)         # 5行
+test_batting_jp  |> filter(!str_detect(年度, "^\\d{4}$"))      # 0行
+test_pitching_jp |> filter(!str_detect(年度, "^\\d{4}$"))      # 0行
+```
+
+## Run all the player (1926 players)
+
+```{r}
+player_results_jp <- map(players_jp$player_url, safe_scrape_player_jp, .progress = TRUE)
+
+bio_jp      <- player_results_jp |> map("bio")      |> list_rbind()
+batting_jp  <- player_results_jp |> map("batting")  |> list_rbind()
+pitching_jp <- player_results_jp |> map("pitching") |> list_rbind()
+
+failed_jp <- players_jp$player_url[map_lgl(player_results_jp, is.null)]
+length(failed_jp)
+```
+
+### Save in csv 
+
+```{r}
+write_csv(all_rosters_jp, "data/npb_rosters_2010_2020.csv")
+write_csv(bio_jp,         "data/npb_bio_jp.csv")
+write_csv(batting_jp,     "data/npb_batting_jp.csv")
+write_csv(pitching_jp,    "data/npb_pitching_jp.csv")
+```
+
+```{r}
+nrow(bio_jp)
+```
+
+### Check foreign player of not
+
+```{r}
+
+```
+
+#### 43 players: name -\> `false` and draft -\> `true` 
+
+```{r}
+review <- foreign_check |>
+  filter(name_looks_foreign != draft_empty) |>
+  select(player_id, name, 経歴, ドラフト, name_looks_foreign, draft_empty) |>
+  arrange(name_looks_foreign)
+
+review |> print(n = Inf)
+```
+
+```{r}
+player_url <- "https://npb.jp/bis/players/63165116.html"   # T. Sledge
+player_html <- get_page(player_url)
+
+# --- what's inside the name block? ---
+as.character(player_html %>% html_element("div#pc_v_name"))
+
+# --- name: Japanese, kana, and English ---
+name_jp   <- player_html %>% html_element("li#pc_v_name") %>% html_text2() %>% str_trim()
+name_kana <- player_html %>% html_element("li#pc_v_kana") %>% html_text2() %>% str_trim()
+
+name_en <- name_kana %>%
+  str_extract("\\(([^)]+)\\)") %>%
+  str_remove_all("[()]") %>%
+  str_trim()
+
+name_jp     # "Ｔ．スレッジ"
+name_kana   # "ターメル・スレッジ (TERRMEL SLEDGE)"
+name_en     # "TERRMEL SLEDGE"
+
+# --- is this a batter or a pitcher? ---
+has_batting  <- !is.na(player_html %>% html_element("#tablefix_b"))
+has_pitching <- !is.na(player_html %>% html_element("#tablefix_p"))
+
+has_batting
+has_pitching
+
+# --- bio block ---
+as.character(player_html %>% html_element("section#pc_bio"))
+
+# --- batting stats, with year and team ---
+bat_raw <- player_html %>% html_element("#tablefix_b") %>% html_table()
+bat_raw
+
+# year and team have their own classes, so pull them directly if the
+# html_table() version comes out messy
+rows <- player_html %>% html_elements("#tablefix_b tr.registerStats")
+
+bat_keys <- tibble(
+  year = rows %>% html_element("td.year") %>% html_text2() %>% str_trim(),
+  team = rows %>% html_element("td.team") %>% html_text2() %>% str_trim()
+)
+
+bat_keys
+```
+
+```{r}
+# 成績表を読む（入れ子の表の問題に対応）
+parse_stats_table <- function(tbl, player_id) {
+  if (inherits(tbl, "xml_missing")) return(NULL)
+  
+  headers <- tbl |> html_elements(xpath = "./thead/tr/th") |> html_text2()
+  
+  tbl |>
+    html_elements(xpath = "./tbody/tr") |>
+    map(\(row) row |>
+          html_elements(xpath = "./td") |>
+          html_text2() |>
+          as.list() |>
+          set_names(headers) |>
+          as_tibble_row()) |>
+    list_rbind() |>
+    filter(str_detect(年度, "^\\d{4}$")) |>        # 通算の行などを除く
+    mutate(across(everything(), \(x) str_remove_all(x, "\\s"))) |>
+    mutate(player_id = player_id, .before = 1)
+}
+
+scrape_player_jp <- function(url) {
+  html      <- get_page(url)
+  player_id <- str_extract(url, "\\d{8}(?=\\.html)")
+  
+  bio <- html |>
+    html_element("#pc_bio table") |>
+    html_table(header = FALSE) |>
+    select(field = X1, value = X2) |>
+    pivot_wider(names_from = field, values_from = value) |>
+    mutate(player_id = player_id,
+           name_jp   = html |> html_element("li#pc_v_name") |> html_text2(),
+           name_kana = html |> html_element("li#pc_v_kana") |> html_text2(),
+           .before = 1) |>
+    select(-any_of("身長／体重"))                     # Part 0 のプライバシーの判断
+  
+  list(
+    bio      = bio,
+    batting  = parse_stats_table(html_element(html, "#tablefix_b"), player_id),
+    pitching = parse_stats_table(html_element(html, "#tablefix_p"), player_id)
+  )
+}
+```
+
+```{r}
+akashi <- scrape_player_jp("https://npb.jp/bis/players/51155119.html")   # 日本人・ドラフトあり
+lee    <- scrape_player_jp("https://npb.jp/bis/players/61865135.html")   # 韓国・ドラフト空欄
+wang   <- scrape_player_jp("https://npb.jp/bis/players/23525138.html")   # 台湾・ドラフト空欄
+
+akashi$bio; lee$bio; wang$bio
+lee$batting
+```
+
+```{r}
+foreign_check <- foreign_check |>
+  mutate(is_foreign = draft_empty)
+
+foreign_check |> count(is_foreign)   # 363 + 43 = 406 playersi
+```
