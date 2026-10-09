@@ -11,7 +11,12 @@ editor: visual
 library(rvest)
 library(tidyverse)
 library(fs)
+
+
+study_years <- 2010:2020      # duration for this project 
 ```
+
+\
 
 ```{r}
 # WORKED EXAMPLE (complete — you don't need to change this)
@@ -118,7 +123,7 @@ batting <- player_html %>%
 batting
 ```
 
-### Combine all 
+### Combine all
 
 ```{r}
 scrape_player_jp <- function(url) {
@@ -261,6 +266,9 @@ roster_clean
 
 ```{r}
 # コードが2010〜2020年で変わらない11球団
+# 注意：constant_codes は2010年以降の球団コード。
+#       2010年より前に広げる場合は、ダイエー・近鉄・旧ヤクルト・旧西武などのコードが必要。
+
 constant_codes <- c(
   "1947001",   # 読売ジャイアンツ
   "1954001",   # 中日ドラゴンズ
@@ -277,19 +285,19 @@ constant_codes <- c(
 
 constant_grid <- expand_grid(
   code = constant_codes,
-  year = 2010:2020
+  year = study_years 
 )
 
 # 横浜：2011年まで横浜ベイスターズ、2012年から横浜DeNAベイスターズ
 yokohama_grid <- tibble(
-  year = 2010:2020,
+  year = study_years,
   code = if_else(year <= 2011, "1993001", "2012001")
 )
 
 roster_grid <- bind_rows(constant_grid, yokohama_grid) |>
   mutate(url = str_glue("https://npb.jp/bis/players/search/yearly/{year}/{code}/"))
 
-nrow(roster_grid)     
+nrow(roster_grid) == 12 * length(study_years)   # True 
 roster_grid |> filter(code %in% c("1993001", "2012001"))   # 横浜の11行を確認
 ```
 
@@ -393,7 +401,7 @@ failed_jp <- players_jp$player_url[map_lgl(player_results_jp, is.null)]
 length(failed_jp)
 ```
 
-### Save in csv 
+### Save in csv
 
 ```{r}
 write_csv(all_rosters_jp, "data/npb_rosters_2010_2020.csv")
@@ -412,7 +420,7 @@ nrow(bio_jp)
 
 ```
 
-#### 43 players: name -\> `false` and draft -\> `true` 
+#### 43 players: name -\> `false` and draft -\> `true`
 
 ```{r}
 review <- foreign_check |>
@@ -485,7 +493,7 @@ parse_stats_table <- function(tbl, player_id) {
           set_names(headers) |>
           as_tibble_row()) |>
     list_rbind() |>
-    filter(str_detect(年度, "^\\d{4}$")) |>        # 通算の行などを除く
+    filter(str_detect(年度, "^\\d{4}$")) |>        # remove 通算
     mutate(across(everything(), \(x) str_remove_all(x, "\\s"))) |>
     mutate(player_id = player_id, .before = 1)
 }
@@ -503,7 +511,7 @@ scrape_player_jp <- function(url) {
            name_jp   = html |> html_element("li#pc_v_name") |> html_text2(),
            name_kana = html |> html_element("li#pc_v_kana") |> html_text2(),
            .before = 1) |>
-    select(-any_of("身長／体重"))                     # Part 0 のプライバシーの判断
+    select(-any_of("身長／体重"))                     
   
   list(
     bio      = bio,
@@ -526,5 +534,124 @@ lee$batting
 foreign_check <- foreign_check |>
   mutate(is_foreign = draft_empty)
 
-foreign_check |> count(is_foreign)   # 363 + 43 = 406 playersi
+foreign_check |> count(is_foreign)   # 363 + 43 = 406 players
 ```
+
+### Position and Arrival year
+
+```{r}
+# players with at least one pitching row
+pitcher_ids <- unique(pitching_jp$player_id)
+hitter_ids  <- unique(batting_jp$player_id)
+
+# earliest NPB season, from both tables
+first_season <- bind_rows(
+  batting_jp  |> select(player_id, 年度),
+  pitching_jp |> select(player_id, 年度)
+) |>
+  group_by(player_id) |>
+  summarise(first_year = min(as.integer(年度)))
+
+foreign_players <- foreign_check |>
+  filter(is_foreign) |>
+  mutate(position = case_when(
+    player_id %in% pitcher_ids ~ "pitcher",
+    player_id %in% hitter_ids  ~ "position",
+    TRUE                       ~ "no_stats"
+  )) |>
+  left_join(first_season, by = "player_id")
+
+foreign_players |> count(position)
+```
+
+```{r}
+foreign_players |>
+  count(position, in_window = between(first_year, 2010, 2020))
+```
+
+```{r}
+study_players <- foreign_players |>
+  filter(position == "position",
+         between(first_year, min(study_years), max(study_years)))
+
+nrow(study_players)    # 148
+
+write_csv(study_players, "data/study_players.csv")
+```
+
+```{r}
+study_players <- study_players |>
+  mutate(prev_club = str_split_i(経歴, " - ", -1))
+
+study_players |> count(prev_club, sort = TRUE) |> print(n = Inf)
+```
+
+MLB - 99 players
+
+minor - 26 players
+
+total 125 players.
+
+```{r}
+study_players <- study_players |>
+  mutate(prev_league = case_when(
+    str_detect(prev_club, "キューバ")    ~ "Cuba",
+    str_detect(prev_club, "韓国")        ~ "KBO",
+    str_detect(prev_club, "台湾")        ~ "CPBL",
+    str_detect(prev_club, "^BC|四国")    ~ "Japan indie",
+    str_detect(prev_club, "米独立")      ~ "US indie",
+    str_detect(prev_club, "ドミニカ")    ~ "Dominican",
+    TRUE                                 ~ "MLB/MiLB"
+  ))
+
+study_players |> count(prev_league, sort = TRUE)
+```
+
+For now analize 2010 - 2025
+
+## Create the low English name and birth date
+
+```{r}
+study_players <- study_players |>
+  mutate(
+    name_en    = str_extract(name_kana, "(?<=[\\(（]).+(?=[\\)）])") |> str_trim(),
+    birth_date = ymd(生年月日)
+  )
+
+study_players |> select(name, name_kana, name_en, 生年月日, birth_date) |> head(10)
+study_players |> filter(is.na(name_en) | is.na(birth_date))   # the player has no english name
+```
+
+### Check the position (it can use to identify pitcher or batter) 
+
+```{r}
+bio_jp |> count(ポジション, sort = TRUE)
+```
+
+# Baseballr
+
+```{r}
+library(baseballr)
+
+chadwick <- chadwick_player_lu()
+
+names(chadwick)
+nrow(chadwick)
+```
+
+Actually, they have `key_npb` ! (And `birth_date` as well)
+
+## Try to make sure I can use `key_npb`
+
+```{r}
+chad_npb <- chadwick |>
+  filter(!is.na(key_npb), key_npb != "") |>
+  select(key_npb, key_mlbam, key_bbref_minors, name_first, name_last,
+         birth_year, birth_month, birth_day)
+
+nrow(chad_npb)          # the number of player has 'key_npb'
+head(chad_npb, 100)          # make sure what kind of form
+chad_npb |> filter(str_detect(name_last, "Keppel"))   # Using ケッペル（41645131）as an example
+```
+
+Yey! They actually have the same id `key_npb`
