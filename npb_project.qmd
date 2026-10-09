@@ -622,13 +622,17 @@ study_players |> select(name, name_kana, name_en, 生年月日, birth_date) |> h
 study_players |> filter(is.na(name_en) | is.na(birth_date))   # the player has no english name
 ```
 
-### Check the position (it can use to identify pitcher or batter) 
+### Check the position (it can use to identify pitcher or batter)
 
 ```{r}
 bio_jp |> count(ポジション, sort = TRUE)
 ```
 
-# Baseballr
+# Baseballr  
+
+## Chadwick: linking NPB players to MLB players
+
+##  
 
 ```{r}
 library(baseballr)
@@ -654,4 +658,125 @@ head(chad_npb, 100)          # make sure what kind of form
 chad_npb |> filter(str_detect(name_last, "Keppel"))   # Using ケッペル（41645131）as an example
 ```
 
-Yey! They actually have the same id `key_npb`
+Yey! They actually have the same id `key_npb.`
+
+But some players misses the first letter.
+
+ex) Shunta Nakatsuka : <https://npb.jp/bis/players/01405134.html>
+
+Jeremy Beasley : <https://npb.jp/bis/eng/players/03905157.html>
+
+If the player id starts from 0 they remove the number so, fix this problem.
+
+### Make 8 digits for the player has 7 digit ID
+
+```{r}
+chad_npb <- chad_npb |>
+  mutate(key_npb = str_pad(as.character(key_npb), width = 8, pad = "0"))
+
+chad_npb |> filter(str_detect(name_last, "Nakatsuka"))   
+```
+
+## Join table 
+
+```{r}
+id_link <- study_players |>
+  filter(prev_league == "MLB/MiLB") |>
+  left_join(chad_npb, by = c("player_id" = "key_npb"))
+
+id_link |> count(in_chadwick = !is.na(name_last), # check the exist in chadwick
+                 has_mlbam   = !is.na(key_mlbam)) # if so check the player has MLB ID 
+```
+
+122 players good, they are baseballr as well. But 3 players are not in baseballr,,?
+
+## Check the birth date is correct
+
+```{r}
+id_link |>
+  filter(!is.na(name_last)) |>
+  mutate(chad_birth = make_date(birth_year, birth_month, birth_day)) |>
+  filter(chad_birth != birth_date) |>
+  select(player_id, name_en, birth_date, chad_birth, name_first, name_last)
+```
+
+The birth date is important for checking the join is correct and to find the 3 players who are missing, and also need for analisis like 'did succesful players arrive younger?'.
+
+```{r}
+id_link <- id_link |>
+  mutate(age_at_arrival = first_year - year(birth_date))
+
+id_link |> 
+  select(name_en, birth_date, first_year, age_at_arrival) |> 
+  filter(name_en == "LESLIE ANDERSON") |> 
+  head()
+```
+
+### Try to find the missing 3 players in baseballr
+
+```{r}
+missing <- id_link |>
+  filter(is.na(name_last))
+
+missing
+```
+
+### Try to fins missing player using birth date and last name
+
+```{r}
+missing |>
+  select(player_id, name, name_en, birth_date) |>    
+  left_join(chad_all, by = c("birth_date" = "chad_birth"),
+            relationship = "many-to-many") |>
+  filter(str_detect(name_en, str_to_upper(name_last))) |>
+  select(player_id, name_en, birth_date, name_first, name_last, key_mlbam)
+```
+
+I found 2 players. So, next try to find the PEREZ. Maybe the writing style is different. So, try to find him his date of birth.
+
+```{r}
+chad_all |>
+  filter(chad_birth == as.Date("1984-11-14")) |>
+  select(key_mlbam, name_first, name_last, name_given, chad_birth,
+         pro_played_first, pro_played_last)
+```
+
+Found the Felix!
+
+```{r}
+manual_ids <- tribble(
+  ~player_id,  ~mlbam_manual,
+  "13715130",  435625L,   # Nate Schierholtz
+  "13915130",  473242L,   # Agustin Murillo
+  "63065132",  591977L    # Felix Perez
+)
+
+write_csv(manual_ids, "data/manual_ids.csv") # to join id_link
+
+
+```
+
+### Join to id_link
+
+```{r}
+id_link <- id_link |>
+  left_join(manual_ids, by = "player_id") |>
+  mutate(
+    id_source = if_else(is.na(key_mlbam), "manual", "chadwick_npb_id"),
+    key_mlbam = coalesce(key_mlbam, mlbam_manual)
+  ) |>
+  select(-mlbam_manual)
+
+sum(is.na(id_link$key_mlbam))              
+```
+
+Everyone has key_mlbam !!! save it as csv\
+
+```{r}
+write_csv(id_link, "data/id_link.csv")
+
+```
+
+## Next step, take data from baseballr
+
+do i need the loop for take the data..?
