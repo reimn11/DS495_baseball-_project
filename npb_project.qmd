@@ -382,7 +382,7 @@ test_bio_jp      <- test_results_jp |> map("bio")      |> list_rbind()
 test_batting_jp  <- test_results_jp |> map("batting")  |> list_rbind()
 test_pitching_jp <- test_results_jp |> map("pitching") |> list_rbind()
 
-test_urls_jp[map_lgl(test_results_jp, is.null)]               # 失敗（空ならOK）
+test_urls_jp[map_lgl(test_results_jp, is.null)]               
 test_bio_jp |> select(player_id, name, 経歴, ドラフト)         # 5行
 test_batting_jp  |> filter(!str_detect(年度, "^\\d{4}$"))      # 0行
 test_pitching_jp |> filter(!str_detect(年度, "^\\d{4}$"))      # 0行
@@ -574,7 +574,7 @@ study_players <- foreign_players |>
   filter(position == "position",
          between(first_year, min(study_years), max(study_years)))
 
-nrow(study_players)    # 148
+nrow(study_players)    
 
 write_csv(study_players, "data/study_players.csv")
 ```
@@ -628,11 +628,20 @@ study_players |> filter(is.na(name_en) | is.na(birth_date))   # the player has n
 bio_jp |> count(ポジション, sort = TRUE)
 ```
 
-# Baseballr  
+# Baseballr
+
+### What `mlb_stats()` does
+
+baseballr is a **collection of functions** for getting baseball data. You’ve used two of them:
+
+| Function               | What it gets                | From where        |
+|------------------------|-----------------------------|-------------------|
+| `chadwick_player_lu()` | player ID directory         | Chadwick Register |
+| `mlb_stats()`          | season stats (leaderboards) | MLB Stats API     |
 
 ## Chadwick: linking NPB players to MLB players
 
-##  
+## 
 
 ```{r}
 library(baseballr)
@@ -677,7 +686,7 @@ chad_npb <- chad_npb |>
 chad_npb |> filter(str_detect(name_last, "Nakatsuka"))   
 ```
 
-## Join table 
+## Join table
 
 ```{r}
 id_link <- study_players |>
@@ -721,7 +730,7 @@ missing <- id_link |>
 missing
 ```
 
-### Try to fins missing player using birth date and last name
+### Try to find missing player using birth date and last name
 
 ```{r}
 missing |>
@@ -777,6 +786,314 @@ write_csv(id_link, "data/id_link.csv")
 
 ```
 
-## Next step, take data from baseballr
+## Take out the data before came to Japan
 
-do i need the loop for take the data..?
+I will try to find `players seasons (20 seasons) × each level` (Major league, AAA, AA, High-A, and Single-A). Then I filter 125 players.
+
+Instead of doing `125 players × each level (5 levels)`, `seasons` times `levels`'s way is more faster, and it can reduce the load on the server.
+
+### Test using one player ( 
+
+```{r}
+test_mlb <- mlb_stats(
+  stat_type   = "season",
+  stat_group  = "hitting",
+  season      = 2013,
+  sport_ids    = 1,          # 1 = MLB
+  player_pool = "All",
+  limit       = 2000
+)
+
+nrow(test_mlb)
+names(test_mlb)
+```
+
+test NATE SCHIERHOLTZ
+
+```{r}
+test_mlb |>
+  filter(player_id == 435625) |>
+  select(season, player_full_name, team_name, num_teams,
+         plate_appearances, avg, obp, slg, ops)
+```
+
+Good
+
+### Chose how many seasons to download
+
+Next step I will chose the seasons to download. I will try to pull 3 seasons before came to Japan
+
+ex) If the player came in 2010 \<- 2007, 2008, 2009
+
+```{r}
+pre_years <- (min(id_link$first_year) - 3):(max(id_link$first_year) - 1)
+pre_years     # 2007:2019
+```
+
+### Getting one season of hitting stats for one level (like 2013, AAA)
+
+Before the function: make a folder for the saved copies
+
+```{r}
+mlb_cache_dir <- "data/mlb_cache"
+dir_create(mlb_cache_dir)
+```
+
+function's input
+
+- `season`: which year, e.g. `2013`
+
+- `sport_id`: which level, e.g. `1` (MLB), `11` (AAA), `12` (AA), 13(Class A advanced), 14 (Class A)
+
+- `limit`: maximum number of players. `= 3000`. It sets the maximum number of players the API will send back in one request.
+
+```{r}
+get_mlb_season <- function(season, sport_id, limit = 3000) {
+  # decide the file name
+  file <- path(mlb_cache_dir, str_glue("hitting_{season}_{sport_id}.rds"))
+  
+  if (file_exists(file)) {
+    return(read_rds(file))
+  }
+  
+  Sys.sleep(2) # it waits 2 seconds to avoid the crush
+  message("Downloading: ", season, " sport_id ", sport_id) # it shows the message
+  
+  # ask MLB's server for the data
+  out <- mlb_stats(stat_type = "season", stat_group = "hitting",
+                   season = season, sport_ids = sport_id, # left: mlb_stats(), right: function
+                   player_pool = "All", limit = limit) 
+ 
+   # two safety check 
+  if (is.null(out) || nrow(out) == 0) stop("No data returned") # mlb_stats -> NULL, stop -> eroor
+  if (nrow(out) >= limit) warning("Hit the limit: ", season, " / ", sport_id) # I'll notice the number of rows reaches to the limit
+  
+  write_rds(out, file) #write_rds saves the table to the file
+  out
+}
+```
+
+Test 2013, MLB
+
+```{r}
+get_mlb_season(2013, 1) |> nrow()    
+```
+
+2017 and 11(AAA) -\> 1592
+
+2016 and 11(AAA) -\> 1627
+
+### Run every season ✖️ level　13 seasons times 5 level
+
+```{r}
+mlb_grid <- expand_grid(season = pre_years, sport_id = c(1, 11, 12, 13, 14))   
+nrow(mlb_grid)                         
+
+safe_get_mlb_season <- possibly(get_mlb_season, otherwise = NULL)
+
+mlb_results <- map2(mlb_grid$season, mlb_grid$sport_id, # it takes 2 lists
+                    safe_get_mlb_season, .progress = TRUE)
+
+mlb_grid[map_lgl(mlb_results, is.null), ]    # failures: expect 0 rows
+```
+
+### Combine and keep only 125 players
+
+```{r}
+pre_npb_all <- mlb_results |> list_rbind()
+nrow(pre_npb_all)                      # all hitters, all seasons, all levels
+```
+
+```{r}
+pre_npb <- pre_npb_all |>
+  rename(mlbam_id = player_id) |>                              # it's the MLB ID!
+  semi_join(id_link, by = c("mlbam_id" = "key_mlbam")) |>
+  mutate(level = case_when(sport_id,
+                            1  ~ "MLB",
+                            11 ~ "AAA",
+                            12 ~ "AA",
+                            13 ~ "High-A",
+                            14 ~ "Low-A"))
+
+n_distinct(pre_npb$mlbam_id)           # how many of the 125 have stats in 2007–2019
+pre_npb |> count(level)                # rows per level
+```
+
+### Save into the csv
+
+```{r}
+write_csv(pre_npb, "data/pre_npb_hitting.csv")
+```
+
+### Find the 5 missing players
+
+```{r}
+missing_pre <- id_link |>
+  anti_join(pre_npb, by = c("key_mlbam" = "mlbam_id")) |>
+  select(player_id, name_en, first_year, key_mlbam, 経歴)
+
+missing_pre
+
+```
+
+Exclude from the stats comparison...
+
+All five players may played lowest levels, below the single A. It does exist Short_Season (sport_id =15) and Rookie, Summer league (sport_id = 16), but they aren’t really comparable with AAA or MLB numbers. They’re a very different kind of player.
+
+ALEJANDRO MEJIA, he was in the summer league
+
+<https://ja.wikipedia.org/wiki/%E3%82%A2%E3%83%AC%E3%83%8F%E3%83%B3%E3%83%89%E3%83%AD%E3%83%BB%E3%83%A1%E3%83%92%E3%82%A2>
+
+IN this project I excluded them.
+
+```{r}
+id_link <- id_link |>
+  mutate(has_pre_npb_stats = key_mlbam %in% pre_npb$mlbam_id)
+
+id_link |> count(has_pre_npb_stats)   
+```
+
+### Keep only the  pre-arrival seasons
+
+```{r}
+pre_npb_before <- pre_npb |>
+  left_join(id_link |> select(key_mlbam, player_id, first_year),
+            by = c("mlbam_id" = "key_mlbam")) |>
+  mutate(season = as.integer(season)) |>
+  filter(season <  first_year,          # before he came to Japan
+         season >= first_year - 3)      # but only the last 3 seasons
+
+n_distinct(pre_npb_before$mlbam_id)
+```
+
+I JUST WONDERING how many players played at least 3 years in those league
+
+```{r}
+pre_npb_before |>
+  group_by(mlbam_id) |>
+  summarise(n_seasons = n_distinct(season)) |>
+  count(n_seasons)
+```
+
+```{r}
+pre_npb_before |>
+  select(plate_appearances, at_bats, hits, base_on_balls, hit_by_pitch,
+         sac_flies, total_bases, home_runs, strike_outs, ops) |>
+  glimpse()
+```
+
+```{r}
+pre_profile <- pre_npb_before |>
+  group_by(player_id, mlbam_id, first_year) |>
+  summarise(
+    n_seasons  = n_distinct(season),
+    pa         = sum(plate_appearances, na.rm = TRUE),
+    ab         = sum(at_bats,           na.rm = TRUE),
+    h          = sum(hits,              na.rm = TRUE),
+    bb         = sum(base_on_balls,     na.rm = TRUE),
+    hbp        = sum(hit_by_pitch,      na.rm = TRUE),
+    sf         = sum(sac_flies,         na.rm = TRUE),
+    tb         = sum(total_bases,       na.rm = TRUE),
+    hr         = sum(home_runs,         na.rm = TRUE),
+    so         = sum(strike_outs,       na.rm = TRUE),
+    mlb_pa     = sum(plate_appearances[level == "MLB"], na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    pre_obp     = (h + bb + hbp) / (ab + bb + hbp + sf),
+    pre_slg     = tb / ab,
+    pre_ops     = pre_obp + pre_slg,
+    pre_hr_rate = hr / pa,
+    pre_k_pct   = so / pa,
+    pre_bb_pct  = bb / pa,
+    mlb_share   = mlb_pa / pa
+  )
+
+nrow(pre_profile)                          # 120
+summary(pre_profile$pre_ops)               # quick check of the range
+
+```
+
+```{r}
+pre_profile |>
+  filter(mlbam_id == 435625) |>
+  select(n_seasons, pa, pre_obp, pre_slg, pre_ops, mlb_share)
+
+write_csv(pre_profile, "data/pre_npb_profile.csv")
+
+```
+
+```{r}
+pre_profile |> 
+  arrange(desc(pre_ops)) |> 
+  select(player_id, pa, n_seasons, pre_ops, mlb_share) |> 
+  head()
+```
+
+```{r}
+pre_profile <- pre_profile |>
+  mutate(pre_small_sample = pa < 200)
+
+pre_profile |> count(pre_small_sample)
+```
+
+```{r}
+names(batting_jp)
+```
+
+```{r}
+npb_first <- batting_jp |>
+  semi_join(pre_profile, by = "player_id") |>                 # only your 120 players
+  left_join(pre_profile |> select(player_id, first_year), by = "player_id") |>
+  mutate(across(c(年度, 試合, 打席, 打数, 安打, 本塁打, 塁打,
+                  四球, 死球, 犠飛, 三振),
+                as.numeric)) |>
+  filter(年度 == first_year) |>                                # first NPB season only
+  group_by(player_id) |>
+  summarise(
+    npb_g   = sum(試合),
+    npb_pa  = sum(打席),
+    npb_ab  = sum(打数),
+    npb_h   = sum(安打),
+    npb_hr  = sum(本塁打),
+    npb_tb  = sum(塁打),
+    npb_bb  = sum(四球),
+    npb_hbp = sum(死球),
+    npb_sf  = sum(犠飛),
+    npb_so  = sum(三振),
+    .groups = "drop"
+  ) |>
+  mutate(
+    npb_obp = (npb_h + npb_bb + npb_hbp) / (npb_ab + npb_bb + npb_hbp + npb_sf),
+    npb_slg = npb_tb / npb_ab,
+    npb_ops = npb_obp + npb_slg
+  )
+
+nrow(npb_first)              # 120
+summary(npb_first$npb_ops)
+summary(npb_first$npb_pa)
+```
+
+```{r}
+write_csv(npb_first, "data/npb_first_season.csv")
+```
+
+```{r}
+analysis <- pre_profile |>
+  inner_join(npb_first, by = "player_id") |>
+  left_join(id_link |>
+              select(player_id, name_en, birth_date, prev_league, 投打),
+            by = "player_id") |>
+  mutate(age_at_arrival = first_year - year(birth_date)) |>
+  relocate(player_id, name_en, first_year, age_at_arrival, prev_league, 投打)
+
+nrow(analysis)          # 120
+glimpse(analysis)
+write_csv(analysis, "data/analysis_table.csv")
+```
+
+```{r}
+analysis |>
+  mutate(success = npb_pa >= 300 & npb_ops >= .700) |>
+  count(success)
+```
