@@ -792,7 +792,7 @@ I will try to find `players seasons (20 seasons) × each level` (Major league, A
 
 Instead of doing `125 players × each level (5 levels)`, `seasons` times `levels`'s way is more faster, and it can reduce the load on the server.
 
-### Test using one player ( 
+### Test using one player (
 
 ```{r}
 test_mlb <- mlb_stats(
@@ -953,7 +953,7 @@ id_link <- id_link |>
 id_link |> count(has_pre_npb_stats)   
 ```
 
-### Keep only the  pre-arrival seasons
+### Keep only the pre-arrival seasons
 
 ```{r}
 pre_npb_before <- pre_npb |>
