@@ -1037,6 +1037,8 @@ pre_profile <- pre_profile |>
 pre_profile |> count(pre_small_sample)
 ```
 
+# Analysis
+
 ```{r}
 names(batting_jp)
 ```
@@ -1096,4 +1098,92 @@ write_csv(analysis, "data/analysis_table.csv")
 analysis |>
   mutate(success = npb_pa >= 300 & npb_ops >= .700) |>
   count(success)
+```
+
+```{r}
+## Analysis
+
+analysis <- read_csv("data/analysis_table.csv",
+                     col_types = cols(player_id = col_character()))
+batting_jp  <- read_csv("data/npb_batting_jp.csv",  col_types = cols(.default = "c"))
+pitching_jp <- read_csv("data/npb_pitching_jp.csv", col_types = cols(.default = "c"))
+```
+
+```{r}
+lg_ops <- batting_jp |>
+  filter(!player_id %in% pitching_jp$player_id) |>
+  mutate(across(c(年度, 打数, 安打, 四球, 死球, 犠飛, 塁打), as.numeric)) |>
+  group_by(year = 年度) |>
+  summarise(
+    lg_ops = (sum(安打) + sum(四球) + sum(死球)) /
+      (sum(打数) + sum(四球) + sum(死球) + sum(犠飛)) +
+      sum(塁打) / sum(打数),
+    .groups = "drop"
+  )
+
+lg_ops |> filter(year >= 2010, year <= 2020)
+```
+
+```{r}
+analysis <- analysis |>
+  left_join(lg_ops, by = c("first_year" = "year")) |>
+  mutate(success = npb_pa >= 300 & npb_ops >= lg_ops)
+
+analysis |> count(success)
+```
+
+```{r}
+ggplot(analysis, aes(pre_ops, npb_ops)) +
+  geom_point(aes(color = mlb_share, size = npb_pa), alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "grey40", linewidth = 0.6) +
+  labs(x = "Pre-NPB OPS (3 seasons before arrival, MLB + MiLB)",
+       y = "First-season NPB OPS",
+       color = "Share of pre-NPB PA in MLB",
+       size  = "NPB PA",
+       title = "Pre-NPB OPS vs. first-season NPB OPS (n = 120)")
+
+cor(analysis$pre_ops, analysis$npb_ops)
+```
+
+```{r}
+analysis |>
+  group_by(success) |>
+  summarise(n = n(),
+            median_pre_ops  = median(pre_ops),
+            median_npb_ops  = median(npb_ops),
+            median_npb_pa   = median(npb_pa),
+            median_age      = median(age_at_arrival),
+            median_mlb_share = median(mlb_share))
+```
+
+```{r}
+comp <- analysis |> filter(!pre_small_sample)
+
+vars <- c("pre_ops", "pre_obp", "pre_slg", "pre_hr_rate",
+          "pre_k_pct", "pre_bb_pct", "mlb_share", "age_at_arrival")
+
+comparison <- map(vars, \(v) tibble(
+  variable       = v,
+  median_success = median(comp[[v]][comp$success]),
+  median_not     = median(comp[[v]][!comp$success]),
+  p_value        = wilcox.test(comp[[v]] ~ comp$success)$p.value
+)) |> list_rbind()
+
+comparison
+```
+
+```{r}
+comp |>
+  select(success, all_of(vars)) |>
+  pivot_longer(-success, names_to = "variable", values_to = "value") |>
+  ggplot(aes(success, value, fill = success)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 4) +
+  labs(x = "Successful in first NPB season?", y = NULL,
+       title = "Pre-NPB characteristics by first-season outcome")
+```
+
+```{r}
+summary(glm(success ~ pre_ops + pre_k_pct + mlb_share + age_at_arrival,
+            data = comp, family = binomial))
 ```
